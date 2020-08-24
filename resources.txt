@@ -1,0 +1,799 @@
+// Copyright 2017 The Sogou Inc. All rights reserved.
+// Author: fanjinsong@sogou-inc.com.
+
+package com.sogou.chromium;
+
+import android.Manifest.permission;
+import android.annotation.SuppressLint;
+import android.content.Context;
+import android.content.SharedPreferences;
+import android.content.pm.PackageInfo;
+import android.content.pm.PackageManager;
+import android.os.Build;
+import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.Process;
+import android.os.StrictMode;
+import android.os.SystemClock;
+import android.text.TextUtils;
+import android.util.Log;
+
+import dalvik.system.BaseDexClassLoader;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.RandomAccessFile;
+import java.nio.channels.FileLock;
+import java.security.MessageDigest;
+import java.util.ArrayList;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.List;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
+
+import org.chromium.base.BuildConfig;
+import org.chromium.base.ContextUtils;
+
+/*
+ * @hide
+ */
+@SuppressLint("NewApi")
+public class ResourceDecompressor {
+    private static final String TAG = "ResourceDecompressor";
+
+    public static class ResourceDecompressorListener {
+        public void onResourceDecompressCompleted(boolean success) { }
+        public void onResourceDownload(String fileName, String version) { }
+    }
+
+    private static final String LIB_PREFIX = "lib";
+    private static final String LIB_SUFFIX = ".so";
+    private static final String PAK_SUFFIX = ".pak";
+    private static final String RESOURCES_DATA = "resources";
+    private static final String CHROME_100   = "chrome_100_percent";
+    private static final String LIBRARY_DATA = "sogouwebview";
+    private static final String LIBRARY_PLAT = "sogouwebview_plat_support";
+    private static final String LIBRARY_LZMA = "sogoulzma";
+    private static final String AWP_CORE = "awp_core.apk";
+    private static final String RESOURCE_VERSION_PREF = "awp_update_time";
+    private static final String LIBRARY_VERSION_PREF =
+            "com.sogou.chromium.ResourceDecompressor.LibVersion";
+    private static final String RES_DECOMPRESS_PREF =
+            "com.sogou.chromium.ResourceDecompressor.success";
+    private static final String LIBRARY_SIZE_PREF = "awp_core_size";
+
+    public static final String[] LIBRARIES = {
+        "libsogouwebview.so",
+    };
+
+    private static final String EXCLUSIVE_LOCK_FILE = "webview_decompress.lock";
+    private static RandomAccessFile sLockFile;
+    private static FileLock sExclusiveFileLock;
+
+    private static final String[] EXTRACT_RESOURCES = {
+        RESOURCES_DATA,
+        LIBRARY_DATA,
+        CHROME_100,
+    };
+
+    private static final int BUFFER_SIZE = 64 * 1024;  // 64 Kb
+
+    private static ResourceDecompressor sInstance;
+
+    private ExecutorService mWorkPool =
+                Executors.newFixedThreadPool(EXTRACT_RESOURCES.length +
+                        BuildConfig.UNCOMPRESSED_LOCALES.length);
+    private final AtomicBoolean mDecompressStarted = new AtomicBoolean();
+    private final CopyOnWriteArrayList<ResourceDecompressorListener> mListeners =
+                new CopyOnWriteArrayList<ResourceDecompressorListener>();
+    private boolean mDecompressSuccess;
+    private boolean mDecompressing;
+    private Context mAppContext;
+    // Whether AWP is enabled.
+    private boolean mAwpEnabled;
+
+    private Handler mUiThreadHandler;
+
+    public static ResourceDecompressor getInstance() {
+        synchronized(ResourceDecompressor.class) {
+            Context ctx = ContextUtils.getRawApplicationContext();
+            if (sInstance == null) {
+                sInstance = new ResourceDecompressor(ctx, BuildConfig.sAwpEnabled);
+            }
+            if (!sInstance.checkContext(ctx)) {
+                throw new RuntimeException("ResourceDecompressor: Invalid Context!");
+            }
+        }
+        return sInstance;
+    }
+
+    public static ResourceDecompressor get(Context ctx) {
+        if (ContextUtils.getRawApplicationContext() == null) {
+            ContextUtils.setRawApplicationContext(ctx);
+        }
+        return getInstance();
+    }
+
+    protected boolean checkContext(Context ctx) {
+        return mAppContext == ctx;
+    }
+
+    private ResourceDecompressor(Context ctx, boolean awpEnabled) {
+        if (ctx == null) {
+            throw new RuntimeException("ResourceDecompressor: Invalid Context!");
+        }
+        mDecompressing = true;
+        mAppContext = ctx;
+        mAwpEnabled = awpEnabled;
+        File resourcesDir = getResourceOutputDir();
+        if (!resourcesDir.exists() && !resourcesDir.mkdirs()) {
+            Log.e(TAG, "Unable to create pak resources directory!");
+        }
+
+        File libraryDir = getLibraryOutputDir();
+        if (!libraryDir.exists() && !libraryDir.mkdirs()) {
+            Log.e(TAG, "Unable to create shared library directory!");
+        }
+
+        mUiThreadHandler = new Handler(Looper.getMainLooper());
+
+        // Check resource and library version.
+        long curAppVersion = getApkVersion();
+        SharedPreferences sharedPrefs = Utils.getSharedPreferences(mAppContext);
+        if (sharedPrefs != null) {
+            long prevAppVersion = sharedPrefs.getLong(RESOURCE_VERSION_PREF, 0);
+            boolean versionChanged = curAppVersion != prevAppVersion;
+            if (versionChanged && BuildConfig.sResourceCompressed) {
+                if (!mAwpEnabled) {
+                    deleteRecursive(getResourceOutputDir());
+                    recordDecompressSuccessful(true);
+                }
+                sharedPrefs.edit().putLong(RESOURCE_VERSION_PREF, curAppVersion).apply();
+            }
+            String prevLibVersion = sharedPrefs.getString(LIBRARY_VERSION_PREF, "");
+            boolean libChanged = !BuildConfig.COMMIT.equals(prevLibVersion);
+            if (libChanged && BuildConfig.sLibraryCompressed) {
+                if (!mAwpEnabled) {
+                    deleteRecursive(getLibraryOutputDir());
+                    deleteRecursive(getDexOutputDir());
+                    deleteRecursive(getDexOATDir());
+                    recordDecompressSuccessful(true);
+                }
+                sharedPrefs.edit().putString(LIBRARY_VERSION_PREF, BuildConfig.COMMIT).apply();
+            }
+
+            File srcFile = new File(getAppDataDir(), "libsogouwebview.so");
+            Log.i(TAG, "srcFile: " + srcFile);
+            if (srcFile.exists() && srcFile.length() != 0) {
+                Log.i(TAG, "successful delete");
+                deleteRecursive(getLibraryOutputDir());
+                deleteRecursive(getDexOutputDir());
+                deleteRecursive(getDexOATDir());
+                recordDecompressSuccessful(true);
+            }
+        }
+
+        if (mAwpEnabled && (!checkAwpCoreReady() || !decompressSuccessful())) {
+            // Clear all old files.
+            deleteCorruptedFiles();
+            resetAwpException();
+            recordDecompressSuccessful(false);
+            updateNativeLibrarySize(0L);
+        }
+    }
+
+    public boolean waitDecompressCompletedAsync() {
+        synchronized(ResourceDecompressor.class) {
+            return mWorkPool.isTerminated() && mDecompressSuccess;
+        }
+    }
+
+    public boolean waitDecompressCompleted() {
+        synchronized(ResourceDecompressor.class) {
+            while(!mWorkPool.isTerminated());
+            return mDecompressSuccess;
+        }
+    }
+
+    public boolean isDecompressing() {
+        synchronized(ResourceDecompressor.class) {
+            return mDecompressing;
+        }
+    }
+
+    public void deleteCorruptedFiles() {
+        if (isDecompressing()) return;
+        deleteRecursive(getResourceOutputDir());
+        deleteRecursive(getLibraryOutputDir());
+        deleteRecursive(getDexOutputDir());
+        deleteRecursive(getDexOATDir());
+    }
+
+    public void deleteAwpBackupFiles() {
+        try {
+            // Delete internal awp_core.apk.
+            File awpCore = new File(mAppContext.getDir("awp", Context.MODE_PRIVATE), AWP_CORE);
+            if (awpCore != null) awpCore.delete();
+            // Delete sdcard awp_core.apk.
+            String state = Environment.getExternalStorageState();
+            if (Environment.MEDIA_MOUNTED.equals(state) &&
+                    checkPermission(permission.WRITE_EXTERNAL_STORAGE)) {
+                String subdir = Utils.isART64(mAppContext) ? "64" : "32";
+                deleteRecursive(new File(Environment.getExternalStorageDirectory(), "awp/" + subdir));
+                deleteRecursive(new File(Environment.getExternalStorageDirectory(), ".awp/" + subdir));
+            }
+            resetAwpException();
+            recordDecompressSuccessful(false);
+            updateNativeLibrarySize(0L);
+        } catch (Throwable e) {
+        }
+    }
+
+    public void recordAwpException() {
+        // Save 'awp_exception' to TRUE.
+        SharedPreferences sharedPrefs = Utils.getSharedPreferences(mAppContext);
+        if (sharedPrefs == null) return;
+        sharedPrefs.edit().putBoolean("awp_exception", true).apply();
+    }
+
+    public void resetAwpException() {
+        // Save 'awp_exception' to TRUE.
+        SharedPreferences sharedPrefs = Utils.getSharedPreferences(mAppContext);
+        if (sharedPrefs == null) return;
+        sharedPrefs.edit().putBoolean("awp_exception", false).apply();
+    }
+
+    private void recordDecompressSuccessful(boolean success) {
+        SharedPreferences sharedPrefs = Utils.getSharedPreferences(mAppContext);
+        if (sharedPrefs == null) return;
+        sharedPrefs.edit().putBoolean(RES_DECOMPRESS_PREF, success).apply();
+    }
+
+    public boolean decompressSuccessful() {
+        synchronized(ResourceDecompressor.class) {
+            // If decompress is running, return early.
+            if (mDecompressing) return true;
+            SharedPreferences sharedPrefs = Utils.getSharedPreferences(mAppContext);
+            if (sharedPrefs == null) return true;
+            return sharedPrefs.getBoolean(RES_DECOMPRESS_PREF, false);
+        }
+    }
+
+    private long nativeLibrarySize() {
+        SharedPreferences sharedPrefs = Utils.getSharedPreferences(mAppContext);
+        if (sharedPrefs == null) return 0L;
+        return sharedPrefs.getLong(LIBRARY_SIZE_PREF, 0L);
+    }
+
+    private void updateNativeLibrarySize(long length) {
+        SharedPreferences sharedPrefs = Utils.getSharedPreferences(mAppContext);
+        if (sharedPrefs == null) return;
+        sharedPrefs.edit().putLong(LIBRARY_SIZE_PREF, length).apply();
+    }
+
+    public void decompressResourceAsync(ResourceDecompressorListener listener) {
+        if (mWorkPool.isTerminated()) {
+            if (listener != null) listener.onResourceDecompressCompleted(mDecompressSuccess);
+        } else if (listener != null){
+            mListeners.add(listener);
+        }
+        if (mDecompressStarted.get()) return;
+        mWorkPool.execute(new Runnable() {
+            @Override
+            public void run() {
+                decompressResource();
+            }
+        });
+    }
+
+    @SuppressLint("UnsafeDynamicallyLoadedCode")
+    public boolean decompressResource() {
+        // This method could be called multiple times and via different threads.
+        if (mDecompressStarted.getAndSet(true)) return true;
+        mDecompressing = true;
+        Log.d(TAG, "Decompress resources from Apk ");
+        long start = SystemClock.uptimeMillis();
+        // The APP might call decompressResource() in a separate process.
+        // Obtaining lock here util another process release it.
+        obtainingLockOrWait();
+        List<Callable<Boolean>> taskList =
+                new ArrayList<Callable<Boolean>>(EXTRACT_RESOURCES.length);
+        mDecompressSuccess = true;
+
+        try {
+            if (mAwpEnabled) {
+                String realName = LIB_PREFIX + LIBRARY_LZMA + LIB_SUFFIX;
+                File lzmaFile = new File(getLibraryOutputDir(), realName);
+                if (!lzmaFile.exists()) lzmaFile.createNewFile();
+                if (lzmaFile.length() == 0) {
+                    InputStream inputStream = getInputStreamFromApkPath(realName);
+                    extractResourceHelper(inputStream, lzmaFile);
+                }
+                try {
+                    System.load(lzmaFile.getPath());
+                } catch (UnsatisfiedLinkError | Exception ex) {
+                    ex.printStackTrace();
+                }
+                File platFile = new File(getLibraryOutputDir(),
+                        LIB_PREFIX + LIBRARY_PLAT + LIB_SUFFIX);
+                if (!platFile.exists()) platFile.createNewFile();
+                if (platFile.length() == 0) {
+                    taskList.add(new CopyTask(LIBRARY_PLAT, platFile.getPath()));
+                }
+            }
+
+            for (String resource : BuildConfig.UNCOMPRESSED_LOCALES) {
+                // Final output file.
+                File destFile = new File(getResourceOutputDir(), resource + PAK_SUFFIX);
+                if (destFile == null || destFile.length() != 0) continue;
+
+                destFile.createNewFile();
+                taskList.add(new CopyTask(resource, destFile.getPath()));
+            }
+            for (String resource : EXTRACT_RESOURCES) {
+                File destFile = null;
+                if (isNativeLibrary(resource)) {
+                    if (!BuildConfig.sLibraryCompressed && !mAwpEnabled) continue;
+                    destFile = new File(getLibraryOutputDir(),
+                            LIB_PREFIX + resource + LIB_SUFFIX);
+                } else if (isAsset(resource)) {
+                    destFile = new File(getResourceOutputDir(), resource + PAK_SUFFIX);
+                }
+                if (destFile == null || destFile.length() != 0) continue;
+
+                destFile.createNewFile();
+                if (isAsset(resource) && !BuildConfig.sResourceCompressed ||
+                        isNativeLibrary(resource) && !BuildConfig.sLibraryCompressed) {
+                    taskList.add(new CopyTask(resource, destFile.getPath()));
+                } else {
+                    taskList.add(new DecompressTask(resource, destFile.getPath()));
+                }
+            }
+
+            try {
+                List<Future<Boolean>> futureList = mWorkPool.invokeAll(taskList);
+                for (Future<Boolean> f : futureList) {
+                    mDecompressSuccess &= f.get();
+                }
+            } catch (InterruptedException | RejectedExecutionException | ExecutionException e) {
+                Log.d(TAG, "Failed to execute decompression");
+                mDecompressSuccess = false;
+            }
+        } catch (Exception e) {
+            Log.d(TAG, e.getLocalizedMessage());
+            mDecompressSuccess = false;
+        } finally {
+            mWorkPool.shutdown();
+            try {
+                if (sExclusiveFileLock != null) sExclusiveFileLock.release();
+            } catch (IOException ex) {
+            }
+            mUiThreadHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    for (ResourceDecompressorListener listener : mListeners) {
+                        listener.onResourceDecompressCompleted(mDecompressSuccess);
+                    }
+                    if (mDecompressSuccess) mListeners.clear();
+                }
+            });
+        }
+        recordDecompressSuccessful(mDecompressSuccess);
+        mDecompressing = false;
+        Log.d(TAG, "Decompress consume : " + (SystemClock.uptimeMillis() - start) + " ms");
+        return mDecompressSuccess;
+    }
+
+    private class CopyTask implements Callable<Boolean> {
+        String mSrcFile;
+        String mDestFile;
+
+        CopyTask(String srcFile, String destFile) {
+            mSrcFile = srcFile;
+            mDestFile = destFile;
+        }
+
+        @Override
+        public Boolean call() {
+            try {
+                InputStream inputStream = null;
+                if (mAwpEnabled) {
+                    String realName = LIB_PREFIX + mSrcFile + LIB_SUFFIX;
+                    String path = getLoadFromApkPath(realName);
+                    inputStream = getInputStreamFromApkPath(realName);
+                } else {
+                    BaseDexClassLoader classLoader =
+                        (BaseDexClassLoader) mAppContext.getClassLoader();
+                    inputStream = new FileInputStream(classLoader.findLibrary(mSrcFile));
+                }
+                File lib = new File(mDestFile);
+                extractResourceHelper(inputStream, lib);
+                if (isNativeLibrary(mSrcFile) && getAwpEnabled()) {
+                    if (lib != null && BuildConfig.MD5.equals(MD5Checksum(lib.getPath()))) {
+                        updateNativeLibrarySize(lib.length());
+                    }
+                }
+                return true;
+            } catch (java.io.IOException e) {
+                return false;
+            }
+        }
+    }
+
+    private class DecompressTask implements Callable<Boolean> {
+        String mSrcFile;
+        String mDestFile;
+
+        DecompressTask(String srcFile, String destFile) {
+            mSrcFile = srcFile;
+            mDestFile = destFile;
+        }
+
+        @Override
+        public Boolean call() {
+            try {
+                String realName = LIB_PREFIX + mSrcFile + LIB_SUFFIX;
+                String path = null;
+                if (mAwpEnabled) {
+                    File tmp = new File(getAppDataDir(), realName);
+                    if (!tmp.exists()) tmp.createNewFile();
+                    path = tmp.getAbsolutePath();
+                    InputStream input = getInputStreamFromApkPath(realName);
+                    // 1.1 Copy Compress file to app_awp dir.
+                    extractResourceHelper(input, tmp);
+                } else {
+                    // 1.2 Find in libs dir.
+
+                    File srcFile = new File(getAppDataDir(), realName);
+                    // It would be better to check that length == expectedLength.
+                    if (!srcFile.exists() || srcFile.length() == 0) {
+                    } else {
+                        path = srcFile.getPath();
+                    }
+                }
+                Log.i(TAG, "path: " + path);
+                // 2. Find in App data dir or trigger download.
+                if (TextUtils.isEmpty(path)) {
+                    BaseDexClassLoader classLoader =
+                            (BaseDexClassLoader) mAppContext.getClassLoader();
+                    path = classLoader.findLibrary(mSrcFile);
+                }
+
+                LzmaUtil.Decode(path, mDestFile);
+                if (isNativeLibrary(mSrcFile) && getAwpEnabled()) {
+                    File lib = new File(mDestFile);
+                    if (lib != null && BuildConfig.MD5.equals(MD5Checksum(lib.getPath()))) {
+                        updateNativeLibrarySize(lib.length());
+                    } else {
+                        // Something is wrong.
+                        if (lib.exists()) lib.delete();
+                        return false;
+                    }
+                }
+                File tmp = new File(getAppDataDir(), realName);
+                if (tmp.exists()) tmp.delete();
+                return true;
+            } catch (Exception e) {
+                e.printStackTrace();
+                if (isNativeLibrary(mSrcFile)) {
+                    updateNativeLibrarySize(0L);
+                }
+                return false;
+            }
+        }
+    }
+
+    private void extractResourceHelper(InputStream is, File outFile) throws IOException {
+        if (is == null) return;
+        OutputStream os = null;
+        try {
+            byte[] buffer = new byte[BUFFER_SIZE];
+            os = new FileOutputStream(outFile);
+            Log.i(TAG, "Extracting " + outFile.getName());
+
+            int count = 0;
+            while ((count = is.read(buffer, 0, BUFFER_SIZE)) != -1) {
+                os.write(buffer, 0, count);
+            }
+        } finally {
+            try {
+                if (os != null) {
+                    os.close();
+                }
+            } finally {
+                if (is != null) {
+                    is.close();
+                }
+            }
+        }
+    }
+
+    private void downloadResourceAsync(String fileName) {
+        if (mListeners.isEmpty() && BuildConfig.sLibraryOta) {
+            throw new RuntimeException("ResourceDecompressorListener is null!");
+        }
+        mUiThreadHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                for (ResourceDecompressorListener listener : mListeners) {
+                    // Now, we just download shared library file.
+                    listener.onResourceDownload(fileName, BuildConfig.VERSION);
+                }
+            }
+        });
+    }
+
+    private void obtainingLockOrWait() {
+        StrictMode.ThreadPolicy oldPolicy = StrictMode.allowThreadDiskReads();
+        StrictMode.allowThreadDiskWrites();
+        try {
+            String dataPath = getAppDataDir().getPath();
+            File lockFile = new File(dataPath, EXCLUSIVE_LOCK_FILE);
+            try {
+                // Note that the file is kept open intentionally.
+                sLockFile = new RandomAccessFile(lockFile, "rw");
+                sExclusiveFileLock = sLockFile.getChannel().lock();
+            } catch (IOException | IllegalArgumentException e) {
+                Log.w(TAG, "Failed to create lock file " + lockFile, e);
+            }
+        } finally {
+            StrictMode.setThreadPolicy(oldPolicy);
+        }
+    }
+
+    // Returns a number that is different each time the apk changes.
+    private long getApkVersion() {
+        PackageManager pm = mAppContext.getPackageManager();
+        try {
+            // More appropriate would be versionCode, but it doesn't change while developing.
+            PackageInfo pi = pm.getPackageInfo(mAppContext.getPackageName(), 0);
+            return pi.lastUpdateTime;
+        } catch (Throwable e) {
+            return 0;
+        }
+    }
+
+    private boolean checkPermission(String permission) {
+        try {
+            return mAppContext.checkPermission(permission, Process.myPid(), Process.myUid()) ==
+                PackageManager.PERMISSION_GRANTED;
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    private void deleteOldResources() {
+        File resources = new File(getResourceOutputDir(),
+                RESOURCES_DATA + PAK_SUFFIX);
+        if (resources.exists() && !resources.delete()) {
+            Log.e(TAG, "Unable to remove the resources " + resources.getName());
+        }
+    }
+
+    private void deleteOldLibrary() {
+        File library = new File(getLibraryOutputDir(),
+                LIB_PREFIX + LIBRARY_DATA + LIB_SUFFIX);
+        if (library.exists() && !library.delete()) {
+            Log.e(TAG, "Unable to remove the library " + library.getName());
+        }
+    }
+
+    private void deleteFile(String resource) {
+        File file = new File(getAppDataDir(), resource);
+        if (file.exists() && !file.delete()) {
+            Log.e(TAG, "Unable to remove the resource " + file.getName());
+        }
+    }
+
+    public File getAppDataDir() {
+        if (mAppContext == null) {
+            throw new RuntimeException("ResourceDecompress: Applcaiton context cannot be null!");
+        }
+        return mAppContext.getDir("sogou_webview", Context.MODE_PRIVATE);
+    }
+
+    public boolean getAwpEnabled() {
+        return mAwpEnabled;
+    }
+
+    public boolean checkOtaCoreReady() {
+        File downloadReady = new File(getAppDataDir(),
+                LIB_PREFIX + LIBRARY_DATA + LIB_SUFFIX);
+        boolean ready = downloadReady != null && downloadReady.length() > 195 * 1000 * 100;
+
+        File webview = new File(getLibraryOutputDir(),
+                LIB_PREFIX + LIBRARY_DATA + LIB_SUFFIX);
+        return ready || webview != null && webview.length() > 40 * 1000 * 1000;
+    }
+
+    public boolean checkAwpCoreReady() {
+        if (!getAwpEnabled()) return true;
+
+        // Check library.
+        File webview = new File(getLibraryOutputDir(),
+                LIB_PREFIX + LIBRARY_DATA + LIB_SUFFIX);
+        if (webview == null || webview.length() == 0 || nativeLibrarySize() == 0
+                || webview.length() != nativeLibrarySize()) {
+            return false;
+        }
+
+        File plat = new File(getLibraryOutputDir(),
+                LIB_PREFIX + LIBRARY_PLAT + LIB_SUFFIX);
+        if (plat == null || plat.length() == 0) return false;
+
+        // Check paks.
+        File resources = new File(getResourceOutputDir(), RESOURCES_DATA + PAK_SUFFIX);
+        if (resources == null || resources.length() == 0) return false;
+
+        File chrome = new File(getResourceOutputDir(), CHROME_100 + PAK_SUFFIX);
+        if (chrome == null || chrome.length() == 0) return false;
+
+        return true;
+    }
+
+    public File getResourceOutputDir() {
+        File dir = new File(getAppDataDir(), "paks");
+        if (!dir.exists()) {
+            dir.mkdir();
+        }
+        return dir;
+    }
+
+    public File getLibraryOutputDir() {
+        if (mAppContext == null) {
+            throw new RuntimeException("ResourceDecompress: Applcaiton context cannot be null!");
+        }
+        File awp = mAppContext.getDir("awp", Context.MODE_PRIVATE);
+        File dir = new File(awp, "core_shared");
+        if (!dir.exists()) {
+            dir.mkdir();
+        }
+        return dir;
+    }
+
+    public File getDexOutputDir() {
+        if (mAppContext == null) {
+            throw new RuntimeException("ResourceDecompress: Applcaiton context cannot be null!");
+        }
+        File awp = mAppContext.getDir("awp", Context.MODE_PRIVATE);
+        File dir = new File(awp, "core_private");
+        if (!dir.exists()) {
+            dir.mkdir();
+        }
+        return dir;
+    }
+
+    public File getDexOATDir() {
+        if (mAppContext == null) {
+            throw new RuntimeException("ResourceDecompress: Applcaiton context cannot be null!");
+        }
+        File awp = mAppContext.getDir("awp", Context.MODE_PRIVATE);
+        File dir = new File(awp, "oat");
+        if (!dir.exists()) {
+            dir.mkdir();
+        }
+        return dir;
+    }
+
+    public static boolean isNativeLibrary(String resource) {
+        return resource.equals(LIBRARY_DATA);
+    }
+
+    public static boolean isAsset(String resource) {
+        return resource.equals(RESOURCES_DATA) || resource.equals(CHROME_100);
+    }
+
+    public String MD5Checksum(String filepath) {
+        byte[] b = createChecksum(filepath);
+        String result = "";
+        for (int i = 0; b != null && i < b.length; i++) {
+            result += Integer.toString((b[i] & 0xff) + 0x100, 16).substring(1);
+        }
+        return result;
+    }
+
+    private byte[] createChecksum(String filepath) {
+        InputStream fis = null;
+        byte[] md5 = null;
+        try {
+            fis = new FileInputStream(filepath);
+            byte[] buffer = new byte[1024];
+            MessageDigest complete = MessageDigest.getInstance("MD5");
+            int numRead;
+            do {
+                numRead = fis.read(buffer);
+                if (numRead > 0) {
+                    complete.update(buffer, 0, numRead);
+                }
+            } while (numRead != -1);
+            md5 = complete.digest();
+        } catch (Throwable e) {
+            md5 = null;
+        } finally {
+            try {
+                if (fis != null) fis.close();
+            } catch (Exception ignore) {
+            }
+            return md5;
+        }
+    }
+
+
+    private static void deleteRecursive(File file) {
+        if (file == null || !file.exists()) return;
+        if (file.isDirectory()) {
+            for (File child : file.listFiles()) {
+                deleteRecursive(child);
+            }
+        }
+        file.delete();
+    }
+
+    private InputStream getInputStreamFromApkPath(String fileName) throws IOException {
+        File dir = mAppContext.getDir("awp", Context.MODE_PRIVATE);
+        String apkPath = dir.getAbsolutePath() + File.separator + AWP_CORE;
+        String [] abis =
+            Build.VERSION.SDK_INT >= 21 ?
+            Build.SUPPORTED_32_BIT_ABIS : new String[]{ Build.CPU_ABI, };
+        String path =  getLoadFromApkPathByABI(apkPath, abis, fileName);
+        if (TextUtils.isEmpty(path)) {
+            abis = Build.VERSION.SDK_INT >= 21 ?
+                Build.SUPPORTED_64_BIT_ABIS : new String[]{ Build.CPU_ABI2, };
+            path = getLoadFromApkPathByABI(apkPath, abis, fileName);
+        }
+
+        if (TextUtils.isEmpty(path)) return null;
+        ZipFile zipFile = new ZipFile(apkPath);
+        ZipEntry entry = zipFile.getEntry(path);
+        return zipFile.getInputStream(entry);
+    }
+
+    public String getLoadFromApkPath(String fileName) {
+        File dir = mAppContext.getDir("awp", Context.MODE_PRIVATE);
+        String apkPath = dir.getAbsolutePath() + File.separator + AWP_CORE;
+        String [] abis =
+            Build.VERSION.SDK_INT >= 21 ?
+            Build.SUPPORTED_32_BIT_ABIS : new String[]{ Build.CPU_ABI, };
+        String path =  getLoadFromApkPathByABI(apkPath, abis, fileName);
+        if (TextUtils.isEmpty(path)) {
+            abis = Build.VERSION.SDK_INT >= 21 ?
+                Build.SUPPORTED_64_BIT_ABIS : new String[]{ Build.CPU_ABI2, };
+            path = getLoadFromApkPathByABI(apkPath, abis, fileName);
+        }
+
+        if (TextUtils.isEmpty(path)) return "";
+        return apkPath + "/" + path;
+    }
+
+    private static String getLoadFromApkPathByABI(String apkPath,
+                                             String[] abiList, String nativeLibFileName) {
+        // Search the APK for a native library conforming to a listed ABI.
+        try (ZipFile z = new ZipFile(apkPath)) {
+            for (String abi : abiList) {
+                final String entry =
+                    "lib" + File.separator + abi + File.separator + nativeLibFileName;
+                ZipEntry e = z.getEntry(entry);
+                if (e != null && e.getMethod() == ZipEntry.STORED) {
+                    // Return a path formatted for dlopen() load from APK.
+                    // return apkPath + "!/" + entry;
+                    return entry;
+                }
+            }
+        } catch (IOException e) {
+        }
+        return "";
+    }
+}
+
